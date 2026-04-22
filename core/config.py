@@ -3,7 +3,7 @@ HEADERS = {
     'Accept-Encoding': "gzip"
 }
 
-from typing import Dict
+from typing import Dict, Any
 
 
 def HeadersHandle(app_name: Any, custom_headers: list) -> Dict[str, str]:
