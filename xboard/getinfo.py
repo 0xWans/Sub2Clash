@@ -48,10 +48,10 @@ class Xboard:
             'email': self.username,
             'password': self.password,
         }
-
-        with self.session.post(url=url, json=payload, headers=headers) as response:
+        print(url,payload)
+        with self.session.post(url=url, data=payload, headers=headers) as response:
             if self.plat == "xboardV3" and response.status_code == 404 and fallback_url:
-                with self.session.post(url=fallback_url, json=payload, headers=headers) as fallback_response:
+                with self.session.post(url=fallback_url, data=payload, headers=headers) as fallback_response:
                     response = fallback_response
 
             print(f"状态码: {response.status_code}")
@@ -70,9 +70,9 @@ class Xboard:
             else:
                 raise RuntimeError(f"登录失败，状态码: {response.status_code}")
 
-    def xboardGetUserSubInfo(self):
+    def xboardGetUserSubInfo(self,base_url):
         with self.session.get(
-            url=f"{self.base_url}/api/v1/user/getSubscribe",
+            url=f"{base_url}/user/getSubscribe",
             headers={
                 **self.headers,
                 "Content-Type": "application/json",
@@ -92,7 +92,7 @@ class Xboard:
         }
         print("获取订阅链接!!!!")
         if self.plat == "xboardV1":
-            self.xboardGetUserSubInfo()
+            self.xboardGetUserSubInfo(self.base_url + "/api/v1")
             self.sub_url = str(self.xboardUserSubInfo.get("data").get("subscribe_url"))
             with self.session.get(url=self.sub_url, headers=headers, params=self.params) as response:
                 sub_status_code = response.status_code
@@ -110,6 +110,21 @@ class Xboard:
                 print(f"请求头:")
                 for k,v in response.request.headers.items():
                     print(f'"{k}": "{v}"')
+        elif self.plat == "xboardV3":
+            self.xboardGetUserSubInfo(self.base_url)
+            self.sub_url = str(self.xboardUserSubInfo.get("data").get("subscribe_url"))
+            del headers['Content-Type']
+            del headers['Accept-Encoding']
+            del headers['Accept']
+            del headers['Connection']
+            with self.session.get(url=self.sub_url, headers=headers, params=self.params) as response:
+                sub_status_code = response.status_code
+                if sub_status_code != 200:
+                    sub_data = "你买了吗？？？？"
+                else:
+                    sub_data = response.text
+                    print(f"订阅链接: {response.request.url}")
+                    print(f"请求头: {response.request.headers}")
         else:
             raise RuntimeError(f"不支持的平台: {self.plat}")
         print(f"""
