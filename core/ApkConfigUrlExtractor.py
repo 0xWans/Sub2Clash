@@ -78,6 +78,8 @@ def getAppConfigData(app_hex_url: Dict) -> Dict[str, Any]:
     }
     """
     de_data, app_name, plat = None, "Mozilla/5.0 (dart:io) SuperAccelerator", None
+    key_aes = b'X#9kL$mN2pQ!rS4tU@vW6xY*zB8cD0eF'
+    iv = b'A!tL@s#I$v%2^0&2'
     for key, value in app_hex_url.items():
         if key == "xboardV1" and value:
             with requests.get(url=str(value[0]), headers=HEADERS) as resp:
@@ -85,7 +87,7 @@ def getAppConfigData(app_hex_url: Dict) -> Dict[str, Any]:
                 plat = key
         elif key == "xboardV2" and value:
             with requests.get(value[0], headers=HEADERS) as resp:
-                de_data = decrypt_base64_aes(resp.text)
+                de_data = decrypt_base64_aes(resp.text,key_aes,iv)
                 app_name = resp.request.url.split("/")[-1]
                 plat = key
         elif key == "xboardV3" and value:

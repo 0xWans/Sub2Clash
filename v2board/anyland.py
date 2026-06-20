@@ -1,19 +1,18 @@
+import base64
+import json
 import time
 import requests
 
 API_URL = "https://47.103.118.115:27018/"
 
-
+KEY = base64.b64decode("ysko2YHO6szW9tv5W6g0RM+XOrVe9A1mvGW5gKwFRZU=")
 def decrypt(enc):
     from Crypto.Cipher import AES
     from Crypto.Util.Padding import unpad
-    import base64
-    key = b'apps_connect_key'
-    iv = b'8c97f304422a60e0'
-    ciphertext = base64.b64decode(enc)
-    cipher = AES.new(key, AES.MODE_CBC, iv)
-    plaintext = unpad(cipher.decrypt(ciphertext), AES.block_size)
-    return plaintext.decode()
+    raw = base64.b64decode(enc)
+    iv, ct = raw[:16], raw[16:]
+    pt = unpad(AES.new(KEY, AES.MODE_CBC, iv).decrypt(ct), 16)
+    return json.loads(pt.decode("utf-8"))
 
 
 def getUserInfo(userName, passWord):

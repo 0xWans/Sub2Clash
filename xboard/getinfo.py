@@ -48,7 +48,7 @@ class Xboard:
             'email': self.username,
             'password': self.password,
         }
-        print(url,payload)
+        print(url, payload, headers)
         with self.session.post(url=url, data=payload, headers=headers) as response:
             if self.plat == "xboardV3" and response.status_code == 404 and fallback_url:
                 with self.session.post(url=fallback_url, data=payload, headers=headers) as fallback_response:
@@ -70,14 +70,15 @@ class Xboard:
             else:
                 raise RuntimeError(f"登录失败，状态码: {response.status_code}")
 
-    def xboardGetUserSubInfo(self,base_url):
+    def xboardGetUserSubInfo(self, base_url):
+        print(base_url)
         with self.session.get(
-            url=f"{base_url}/user/getSubscribe",
-            headers={
-                **self.headers,
-                "Content-Type": "application/json",
-                "authorization": f"{self.loginData.get('data').get('auth_data')}"
-            },
+                url=f"{base_url}/user/getSubscribe",
+                headers={
+                    **self.headers,
+                    "Content-Type": "application/json",
+                    "authorization": f"{self.loginData.get('data').get('auth_data')}"
+                },
         ) as response:
             self.xboardUserSubInfo = response.json()
 
@@ -104,20 +105,20 @@ class Xboard:
                     print(f"请求头: {response.request.headers}")
         elif self.plat == "xboardV2":
             del headers['Content-Type']
-            with self.session.get(url=self.sub_url + "/api/v1/client/subscribe", headers=headers, params=self.params) as response:
+            with self.session.get(url=self.sub_url + "/api/v1/client/subscribe", headers=headers,
+                                  params=self.params) as response:
                 sub_data = response.text
                 print(f"订阅链接: {response.request.url}")
                 print(f"请求头:")
-                for k,v in response.request.headers.items():
+                for k, v in response.request.headers.items():
                     print(f'"{k}": "{v}"')
         elif self.plat == "xboardV3":
             self.xboardGetUserSubInfo(self.base_url)
             self.sub_url = str(self.xboardUserSubInfo.get("data").get("subscribe_url"))
+            print(headers)
             del headers['Content-Type']
-            del headers['Accept-Encoding']
-            del headers['Accept']
-            del headers['Connection']
-            with self.session.get(url=self.sub_url, headers=headers, params=self.params) as response:
+            print(self.sub_url)
+            with self.session.get(url=self.sub_url, headers=headers, params=self.params, verify=False, stream=True) as response:
                 sub_status_code = response.status_code
                 if sub_status_code != 200:
                     sub_data = "你买了吗？？？？"

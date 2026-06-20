@@ -42,7 +42,7 @@ def run(username: str, password: str, apk_path: str) -> None:
 
 
 if __name__ == '__main__':
-    username = '@gmail.com' # 这里填邮箱
-    password = '123456' # 这里填密码
-    apk_path = "/your/path/1.apk"   # 这里填apk的路径
+    username = '' # 这里填邮箱
+    password = '' # 这里填密码
+    apk_path = "/Volumes/Data/Downloads/lmapp-lite.apk"   # 这里填apk的路径
     run(username, password, apk_path)
