@@ -11,96 +11,6 @@ import tempfile
 from pathlib import Path
 
 
-GO_FIND_FUNCS = r'''
-package main
-
-import (
-	"debug/gosym"
-	"debug/macho"
-	"fmt"
-	"os"
-	"strings"
-)
-
-func wantedCPU(arch string) macho.Cpu {
-	switch arch {
-	case "x86_64", "amd64":
-		return macho.CpuAmd64
-	case "arm64", "aarch64":
-		return macho.CpuArm64
-	default:
-		return 0
-	}
-}
-
-func main() {
-	if len(os.Args) != 4 {
-		fmt.Fprintf(os.Stderr, "usage: %s <mach-o> <func-substring> <arch>\n", os.Args[0])
-		os.Exit(2)
-	}
-
-	var f *macho.File
-	want := wantedCPU(os.Args[3])
-	if want == 0 {
-		fmt.Fprintf(os.Stderr, "unsupported arch: %s\n", os.Args[3])
-		os.Exit(2)
-	}
-
-	if fat, err := macho.OpenFat(os.Args[1]); err == nil {
-		for i := range fat.Arches {
-			if fat.Arches[i].Cpu == want {
-				f = fat.Arches[i].File
-				break
-			}
-		}
-		if f == nil {
-			fmt.Fprintf(os.Stderr, "%s slice not found\n", os.Args[3])
-			os.Exit(1)
-		}
-	} else {
-		var err error
-		f, err = macho.Open(os.Args[1])
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-	}
-
-	var pcl []byte
-	var textAddr uint64
-	for _, s := range f.Sections {
-		if s.Name == "__gopclntab" {
-			var err error
-			pcl, err = s.Data()
-			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
-			}
-		}
-		if s.Name == "__text" {
-			textAddr = s.Addr
-		}
-	}
-	if len(pcl) == 0 || textAddr == 0 {
-		fmt.Fprintln(os.Stderr, "missing __gopclntab or __text")
-		os.Exit(1)
-	}
-
-	lt := gosym.NewLineTable(pcl, textAddr)
-	t, err := gosym.NewTable(nil, lt)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	for _, fn := range t.Funcs {
-		if strings.Contains(fn.Name, os.Args[2]) {
-			fmt.Printf("0x%x %s size=%d\n", fn.Entry, fn.Name, fn.End-fn.Entry)
-		}
-	}
-}
-'''
-
-
 class Die(Exception):
     pass
 
@@ -145,23 +55,235 @@ def check_mihomo_symbols(binary):
     return symbols
 
 
-def find_funcs(binary, needle, arch):
-    with tempfile.TemporaryDirectory(prefix="mihomo-find-") as td:
-        helper = Path(td) / "find.go"
-        helper.write_text(GO_FIND_FUNCS)
-        p = run(["go", "run", str(helper), binary, needle, arch])
-    funcs = []
-    for line in p.stdout.splitlines():
-        m = re.match(r"0x([0-9a-fA-F]+)\s+(\S+)\s+size=(\d+)", line.strip())
-        if m:
-            funcs.append(
-                {
-                    "entry": int(m.group(1), 16),
-                    "name": m.group(2),
-                    "size": int(m.group(3)),
-                    "line": line.strip(),
-                }
+def cstr(data, off):
+    if off < 0 or off >= len(data):
+        return ""
+    end = data.find(b"\x00", off)
+    if end < 0:
+        end = len(data)
+    return data[off:end].decode("utf-8", errors="replace")
+
+
+class GoPclnTable:
+    MAGICS = {
+        0xFFFFFFFB: "ver12",
+        0xFFFFFFFA: "ver116",
+        0xFFFFFFF0: "ver118",
+        0xFFFFFFF1: "ver120",
+    }
+
+    def __init__(self, pcln, text_addr):
+        self.data = pcln
+        self.text_addr = text_addr
+        self.order = "little"
+        self.version = None
+        self.ptrsize = 0
+        self.nfunctab = 0
+        self.funcnametab = b""
+        self.funcdata = b""
+        self.functab = b""
+        self.field_size = 0
+        self._parse_header()
+
+    def _uint(self, data, off, size):
+        if off < 0 or off + size > len(data):
+            raise Die("malformed Go pclntab")
+        return int.from_bytes(data[off : off + size], self.order)
+
+    def _uintptr_at(self, off):
+        return self._uint(self.data, off, self.ptrsize)
+
+    def _offset_word(self, word):
+        return self._uintptr_at(8 + word * self.ptrsize)
+
+    def _data_from_word(self, word):
+        off = self._offset_word(word)
+        if off > len(self.data):
+            raise Die("malformed Go pclntab offset")
+        return self.data[off:]
+
+    def _parse_header(self):
+        if (
+            len(self.data) < 16
+            or self.data[4] != 0
+            or self.data[5] != 0
+            or self.data[6] not in (1, 2, 4)
+            or self.data[7] not in (4, 8)
+        ):
+            raise Die("invalid Go pclntab header")
+
+        le_magic = int.from_bytes(self.data[:4], "little")
+        be_magic = int.from_bytes(self.data[:4], "big")
+        if le_magic in self.MAGICS:
+            self.order = "little"
+            self.version = self.MAGICS[le_magic]
+        elif be_magic in self.MAGICS:
+            self.order = "big"
+            self.version = self.MAGICS[be_magic]
+        else:
+            raise Die("unsupported Go pclntab magic")
+
+        self.ptrsize = self.data[7]
+        if self.version in ("ver118", "ver120"):
+            self.nfunctab = self._offset_word(0)
+            self.funcnametab = self._data_from_word(3)
+            self.funcdata = self._data_from_word(7)
+            self.functab = self.funcdata
+            self.field_size = 4
+        elif self.version == "ver116":
+            self.nfunctab = self._offset_word(0)
+            self.funcnametab = self._data_from_word(2)
+            self.funcdata = self._data_from_word(6)
+            self.functab = self.funcdata
+            self.field_size = self.ptrsize
+        else:
+            self.nfunctab = self._uintptr_at(8)
+            self.funcnametab = self.data
+            self.funcdata = self.data
+            self.functab = self.data[8 + self.ptrsize :]
+            self.field_size = self.ptrsize
+
+        size = (self.nfunctab * 2 + 1) * self.field_size
+        if size > len(self.functab):
+            raise Die("malformed Go functab")
+        self.functab = self.functab[:size]
+
+    def _functab_uint(self, index):
+        return self._uint(self.functab, index * self.field_size, self.field_size)
+
+    def pc(self, index):
+        pc = self._functab_uint(2 * index)
+        if self.version in ("ver118", "ver120"):
+            pc += self.text_addr
+        return pc
+
+    def func_offset(self, index):
+        return self._functab_uint(2 * index + 1)
+
+    def name_offset(self, index):
+        off = self.func_offset(index)
+        first_field_size = 4 if self.version in ("ver118", "ver120") else self.ptrsize
+        return self._uint(self.funcdata, off + first_field_size, 4)
+
+    def funcs(self):
+        funcs = []
+        for i in range(self.nfunctab):
+            entry = self.pc(i)
+            end = self.pc(i + 1)
+            name = cstr(self.funcnametab, self.name_offset(i))
+            funcs.append({"entry": entry, "name": name, "size": end - entry})
+        return funcs
+
+
+def read_macho_header(data, off):
+    if off < 0 or off + 32 > len(data):
+        raise Die("invalid Mach-O header")
+    magic = int.from_bytes(data[off : off + 4], "little")
+    if magic == 0xFEEDFACF:
+        order = "little"
+    elif magic == 0xCFFAEDFE:
+        order = "big"
+    else:
+        raise Die("not a 64-bit Mach-O slice")
+    cputype = int.from_bytes(data[off + 4 : off + 8], order, signed=True)
+    ncmds = int.from_bytes(data[off + 16 : off + 20], order)
+    sizeofcmds = int.from_bytes(data[off + 20 : off + 24], order)
+    if off + 32 + sizeofcmds > len(data):
+        raise Die("invalid Mach-O load command table")
+    return order, cputype, ncmds
+
+
+def macho_arch_slices(data):
+    magic = int.from_bytes(data[:4], "big")
+    if magic in (0xCAFEBABE, 0xCAFEBABF):
+        if len(data) < 8:
+            raise Die("invalid fat Mach-O header")
+        nfat_arch = int.from_bytes(data[4:8], "big")
+        stride = 32 if magic == 0xCAFEBABF else 20
+        slices = []
+        for i in range(nfat_arch):
+            off = 8 + i * stride
+            if off + stride > len(data):
+                raise Die("invalid fat Mach-O arch table")
+            cputype = int.from_bytes(data[off : off + 4], "big", signed=True)
+            offset_size = 8 if stride == 32 else 4
+            slice_off = int.from_bytes(data[off + 8 : off + 8 + offset_size], "big")
+            slice_size = int.from_bytes(
+                data[off + 8 + offset_size : off + 8 + offset_size * 2], "big"
             )
+            if slice_off + slice_size > len(data):
+                raise Die("invalid fat Mach-O slice")
+            slices.append({"cputype": cputype, "off": slice_off, "size": slice_size})
+        return slices
+
+    order, cputype, _ = read_macho_header(data, 0)
+    return [{"cputype": cputype, "off": 0, "size": len(data), "order": order}]
+
+
+def wanted_macho_cpu(arch):
+    if arch == "x86_64":
+        return 0x01000007
+    if arch == "arm64":
+        return 0x0100000C
+    raise Die(f"unsupported arch: {arch}")
+
+
+def find_macho_section_data(binary, arch, sectname):
+    data = Path(binary).read_bytes()
+    want = wanted_macho_cpu(arch)
+    slice_info = next((s for s in macho_arch_slices(data) if s["cputype"] == want), None)
+    if slice_info is None:
+        raise Die(f"{arch} slice not found")
+
+    slice_off = slice_info["off"]
+    order, _, ncmds = read_macho_header(data, slice_off)
+    cursor = slice_off + 32
+    text_addr = 0
+    pcln = None
+    for _ in range(ncmds):
+        if cursor + 8 > len(data):
+            raise Die("invalid Mach-O load command")
+        cmd = int.from_bytes(data[cursor : cursor + 4], order)
+        cmdsize = int.from_bytes(data[cursor + 4 : cursor + 8], order)
+        if cmdsize < 8 or cursor + cmdsize > len(data):
+            raise Die("invalid Mach-O load command size")
+        if cmd == 0x19:
+            nsects = int.from_bytes(data[cursor + 64 : cursor + 68], order)
+            sect_off = cursor + 72
+            for i in range(nsects):
+                s = sect_off + i * 80
+                if s + 80 > cursor + cmdsize:
+                    raise Die("invalid Mach-O section table")
+                name = data[s : s + 16].split(b"\x00", 1)[0].decode("ascii", errors="replace")
+                segment = data[s + 16 : s + 32].split(b"\x00", 1)[0].decode(
+                    "ascii", errors="replace"
+                )
+                addr = int.from_bytes(data[s + 32 : s + 40], order)
+                size = int.from_bytes(data[s + 40 : s + 48], order)
+                offset = int.from_bytes(data[s + 48 : s + 52], order)
+                if name == "__text":
+                    text_addr = addr
+                if name == sectname:
+                    start = slice_off + offset
+                    end = start + size
+                    if end > len(data):
+                        raise Die("invalid Mach-O section data")
+                    pcln = data[start:end]
+        cursor += cmdsize
+
+    if text_addr == 0 or not pcln:
+        raise Die(f"missing {sectname} or __text")
+    return pcln, text_addr
+
+
+def find_funcs(binary, needle, arch):
+    pcln, text_addr = find_macho_section_data(binary, arch, "__gopclntab")
+    table = GoPclnTable(pcln, text_addr)
+    funcs = []
+    for f in table.funcs():
+        if needle in f["name"]:
+            f["line"] = f"0x{f['entry']:x} {f['name']} size={f['size']}"
+            funcs.append(f)
     return funcs
 
 
@@ -292,6 +414,46 @@ def get_key_iv(binary, arch, max_instructions):
     return fn, constants, key, iv, lines
 
 
+def find_mihomo_binary(root):
+    candidates = []
+    for path in Path(root).rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            with path.open("rb") as f:
+                head = f.read(4)
+        except OSError:
+            continue
+        if head in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"):
+            candidates.append(path)
+
+    matches = []
+    for path in candidates:
+        try:
+            symbols = check_mihomo_symbols(path)
+        except Die:
+            continue
+        matches.append((path, symbols))
+
+    if not matches:
+        raise Die(f"no Mach-O binary with mihomo convert symbols found under: {root}")
+    matches.sort(key=lambda x: ("/Contents/MacOS/" not in str(x[0]), len(str(x[0]))))
+    return matches[0]
+
+
+def resolve_binary(input_path, temp_dir):
+    path = Path(os.path.expanduser(input_path)).resolve()
+    if not path.is_file():
+        raise Die(f"input not found: {path}")
+    if path.suffix.lower() != ".pkg":
+        return str(path), None
+
+    extract_dir = Path(temp_dir) / "pkg"
+    run(["pkgutil", "--expand-full", str(path), str(extract_dir)])
+    binary, symbols = find_mihomo_binary(extract_dir)
+    return str(binary), symbols
+
+
 def load_aes_backend():
     try:
         from Crypto.Cipher import AES
@@ -388,11 +550,11 @@ def validate_yaml(data):
 
 def main(argv):
     ap = argparse.ArgumentParser(
-        description="Decrypt mihomo/Clash.Meta fork AES-base64 profile YAML."
+        description="Extract or use mihomo/Clash.Meta fork AES-base64 profile KEY/IV."
     )
-    ap.add_argument("binary", help="path to the macOS Clash/mihomo core Mach-O binary")
-    ap.add_argument("encrypted", help="path to the encrypted profile YAML")
-    ap.add_argument("output", help="path for decrypted YAML output")
+    ap.add_argument("input", help="path to macOS .pkg or Clash/mihomo core Mach-O binary")
+    ap.add_argument("encrypted", nargs="?", help="path to the encrypted profile YAML")
+    ap.add_argument("output", nargs="?", help="path for decrypted YAML output")
     ap.add_argument("--arch", choices=("x86_64", "arm64"), default="x86_64")
     ap.add_argument(
         "--max-instructions",
@@ -401,53 +563,61 @@ def main(argv):
         help="number of function instructions to inspect from DecodeAESBase64",
     )
     args = ap.parse_args(argv)
+    if (args.encrypted is None) != (args.output is None):
+        ap.error("encrypted and output must be provided together")
 
-    binary = os.path.abspath(os.path.expanduser(args.binary))
-    encrypted = os.path.abspath(os.path.expanduser(args.encrypted))
-    output = os.path.abspath(os.path.expanduser(args.output))
+    encrypted = os.path.abspath(os.path.expanduser(args.encrypted)) if args.encrypted else None
+    output = os.path.abspath(os.path.expanduser(args.output)) if args.output else None
+    if encrypted and not os.path.isfile(encrypted):
+        raise Die(f"encrypted profile not found: {encrypted}")
 
-    for path, label in ((binary, "binary"), (encrypted, "encrypted profile")):
-        if not os.path.isfile(path):
-            raise Die(f"{label} not found: {path}")
+    decrypting = encrypted is not None
+    total_steps = 5 if decrypting else 4
+    with tempfile.TemporaryDirectory(prefix="mihomo-profile-") as td:
+        print(f"[1/{total_steps}] resolving input")
+        binary, symbols = resolve_binary(args.input, td)
+        print(f"      {binary}")
 
-    print("[1/5] checking mihomo convert symbols")
-    symbols = check_mihomo_symbols(binary)
-    for s in symbols:
-        print(f"      {s}")
+        print(f"[2/{total_steps}] checking mihomo convert symbols")
+        if symbols is None:
+            symbols = check_mihomo_symbols(binary)
+        for s in symbols:
+            print(f"      {s}")
 
-    print("[2/5] locating convert.DecodeAESBase64 with Go debug/macho + gosym")
-    fn, constants, key, iv, lines = get_key_iv(binary, args.arch, args.max_instructions)
-    print(f"      {fn['line']}")
+        print(f"[3/{total_steps}] locating convert.DecodeAESBase64 with Mach-O Go pclntab")
+        fn, constants, key, iv, lines = get_key_iv(binary, args.arch, args.max_instructions)
+        print(f"      {fn['line']}")
 
-    print("[3/5] extracting prologue constants")
-    for i, c in enumerate(constants, 1):
-        print(f"      imm{i}: {c['bytes']!r}    {c['line']}")
+        print(f"[4/{total_steps}] derived AES material")
+        for i, c in enumerate(constants, 1):
+            print(f"      imm{i}: {c['bytes']!r}    {c['line']}")
+        print(f"      AES-128-CBC KEY ascii: {key.decode('ascii')}")
+        print(f"      AES-128-CBC IV  ascii: {iv.decode('ascii')}")
+        print(f"      AES-128-CBC KEY hex:   {key.hex()}")
+        print(f"      AES-128-CBC IV  hex:   {iv.hex()}")
 
-    print("[4/5] derived AES material")
-    print(f"      AES-128-CBC KEY ascii: {key.decode('ascii')}")
-    print(f"      AES-128-CBC IV  ascii: {iv.decode('ascii')}")
-    print(f"      AES-128-CBC KEY hex:   {key.hex()}")
-    print(f"      AES-128-CBC IV  hex:   {iv.hex()}")
+        if not decrypting:
+            return
 
-    print("[5/5] decrypting and validating output")
-    data, backend = decrypt_profile(encrypted, output, key, iv)
-    prefix_ok, size_ok, yaml_ok, yaml_error = validate_yaml(data)
-    print(f"      AES backend: {backend}")
-    print(f"      wrote: {output}")
-    print(f"      size: {len(data)} bytes")
-    print(f"      starts with Clash YAML key: {prefix_ok}")
-    print(f"      size 10KB-1MB: {size_ok}")
-    if yaml_ok is True:
-        print("      yaml.safe_load: ok")
-    elif yaml_ok is False:
-        print(f"      yaml.safe_load: failed: {yaml_error}")
-    else:
-        print(f"      yaml.safe_load: skipped: {yaml_error}")
+        print("[5/5] decrypting and validating output")
+        data, backend = decrypt_profile(encrypted, output, key, iv)
+        prefix_ok, size_ok, yaml_ok, yaml_error = validate_yaml(data)
+        print(f"      AES backend: {backend}")
+        print(f"      wrote: {output}")
+        print(f"      size: {len(data)} bytes")
+        print(f"      starts with Clash YAML key: {prefix_ok}")
+        print(f"      size 10KB-1MB: {size_ok}")
+        if yaml_ok is True:
+            print("      yaml.safe_load: ok")
+        elif yaml_ok is False:
+            print(f"      yaml.safe_load: failed: {yaml_error}")
+        else:
+            print(f"      yaml.safe_load: skipped: {yaml_error}")
 
-    if not prefix_ok or yaml_ok is False:
-        raise Die(
-            "decrypted output did not pass acceptance checks; check imm64 byte order or KEY/IV order."
-        )
+        if not prefix_ok or yaml_ok is False:
+            raise Die(
+                "decrypted output did not pass acceptance checks; check imm64 byte order or KEY/IV order."
+            )
 
 
 if __name__ == "__main__":

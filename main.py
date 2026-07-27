@@ -1,13 +1,46 @@
+from pathlib import Path
+
 from core.ApkConfigUrlExtractor import getAppConfigUrl, getAppConfigData
 from core.config import HeadersHandle, HEADERS
+from flclash import decrypt_mihomo_profile, extract_mihomo_apk_aes
 from xboard.getinfo import Xboard
 
 
+FLCLASH_HANDLERS = {
+    ".apk": extract_mihomo_apk_aes.main,
+    ".pkg": decrypt_mihomo_profile.main,
+}
+
+
+def run_flclash_by_suffix(file_path: str) -> None:
+    suffix = Path(file_path).suffix.lower()
+    handler = FLCLASH_HANDLERS.get(suffix)
+    if handler is None:
+        support_suffixes = ", ".join(sorted(FLCLASH_HANDLERS))
+        raise ValueError(f"flclash暂不支持该文件后缀: {suffix or '<无后缀>'}，支持: {support_suffixes}")
+    handler([file_path])
+
+
 def run(username: str, password: str, apk_path: str) -> None:
+    if Path(apk_path).suffix.lower() != ".apk":
+        print("匹配到flclash处理流程......")
+        try:
+            run_flclash_by_suffix(apk_path)
+        except (extract_mihomo_apk_aes.Die, decrypt_mihomo_profile.Die, ValueError) as e:
+            print(f"flclash处理失败: {e}")
+        return
+
     # 获取配置文件的url
     print("获取登录的接口......")
     config_url = getAppConfigUrl(apk_path)
     print(config_url)
+    if len(config_url) == 3:
+        print("匹配到flclash处理流程......")
+        try:
+            run_flclash_by_suffix(apk_path)
+        except (extract_mihomo_apk_aes.Die, decrypt_mihomo_profile.Die, ValueError) as e:
+            print(f"flclash处理失败: {e}")
+        return
     # 配置文件的数据
     print("解密配置文件......")
     data = getAppConfigData(config_url)
@@ -42,7 +75,7 @@ def run(username: str, password: str, apk_path: str) -> None:
 
 
 if __name__ == '__main__':
-    username = '' # 这里填邮箱
-    password = '' # 这里填密码
-    apk_path = "/Volumes/Data/Downloads/lmapp-lite.apk"   # 这里填apk的路径
+    username = ''  # 这里填邮箱
+    password = ''  # 这里填密码
+    apk_path = "/Volumes/Data/Downloads/yytapp-lite.apk"  # 这里填apk的路径
     run(username, password, apk_path)
