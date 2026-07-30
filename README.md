@@ -70,11 +70,9 @@ run(username, password, apk_path)
 
 1. 如果传入的文件不是 `.apk`，直接根据后缀进入 `flclash` 流程。
 2. 如果是 `.apk`，先调用 `getAppConfigUrl(apk_path)` 扫描配置 URL。
-3. 当前 `main.py` 中 `len(config_url) == 3` 时会进入 `flclash` 分发逻辑。
+3. 如果没有找到任何有效配置 URL，进入 `flclash` 分发逻辑。
 4. Xboard 流程会解密配置，生成 `base_url`、`sub_url` 和请求头。
 5. 登录面板后请求订阅接口，并在终端输出订阅链接、请求头和订阅内容。
-
-注意：`getAppConfigUrl()` 当前固定返回包含 `xboardV1`、`xboardV2`、`xboardV3` 三个 key 的 dict，因此 `len(config_url) == 3` 对 `.apk` 通常会一直成立。如果要优先走普通 Xboard 配置解密，需要把判断条件改成“没有找到有效 URL 时再进入 flclash”。
 
 ## flclash 独立用法
 

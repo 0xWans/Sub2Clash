@@ -34,7 +34,7 @@ def run(username: str, password: str, apk_path: str) -> None:
     print("获取登录的接口......")
     config_url = getAppConfigUrl(apk_path)
     print(config_url)
-    if len(config_url) == 3:
+    if not any(config_url.values()):
         print("匹配到flclash处理流程......")
         try:
             run_flclash_by_suffix(apk_path)
@@ -75,7 +75,7 @@ def run(username: str, password: str, apk_path: str) -> None:
 
 
 if __name__ == '__main__':
-    username = ''  # 这里填邮箱
-    password = ''  # 这里填密码
-    apk_path = "/Volumes/Data/Downloads/yytapp-lite.apk"  # 这里填apk的路径
+    username = '1234Abcd@gmail.com'  # 这里填邮箱
+    password = '1234Abcd'  # 这里填密码
+    apk_path = "/Volumes/Data/Downloads/ziyoumao-3.1.0-universal.apk"  # 这里填apk的路径
     run(username, password, apk_path)
